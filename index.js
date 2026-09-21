@@ -353,7 +353,7 @@ client.on('interactionCreate', async interaction => {
 
         if (interaction.customId === 'btn_script') {
             await interaction.reply({ 
-                content: '📜 **BOBOHUB Script Loadstring:**\n`https://raw.githubusercontent.com/bokaganteng12-wq/idv/refs/heads/main/idv`', 
+                content: '📜 **BOBOHUB Script Loadstring:**\n`loadstring(game:HttpGet("https://raw.githubusercontent.com/bokaganteng12-wq/idv/refs/heads/main/idv"))()`', 
                 ephemeral: true 
             });
         }
