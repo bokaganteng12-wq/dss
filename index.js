@@ -1,5 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const midtransClient = require('midtrans-client');
 require('dotenv').config();
 const { 
     Client, 
@@ -16,11 +17,16 @@ const {
     PermissionFlagsBits
 } = require('discord.js');
 
-// --- 1. SETUP EXPRESS & MONGODB ---
+// --- 1. SETUP EXPRESS, MONGODB & MIDTRANS ---
 const app = express();
 app.use(express.json());
 
-// Tambahan agar halaman utama (GET /) tidak "Cannot GET /"[cite: 4]
+const coreApi = new midtransClient.CoreApi({
+    isProduction: false,
+    serverKey: process.env.MIDTRANS_SERVER_KEY,
+    clientKey: process.env.MIDTRANS_CLIENT_KEY
+});
+
 app.get('/', (req, res) => {
     res.send('🚀 BOBOHUB API Server is Online and Running!');
 });
@@ -40,6 +46,15 @@ const keySchema = new mongoose.Schema({
 });
 
 const KeyModel = mongoose.model('BoboHubKeys', keySchema);
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers
+    ]
+});
 
 // --- 2. API ENDPOINT UNTUK VERIFIKASI ROBLOX (AUTO-BIND HWID) ---
 app.post('/api/verify', async (req, res) => {
@@ -82,19 +97,74 @@ app.post('/api/verify', async (req, res) => {
     }
 });
 
+// --- 2.1 MIDTRANS NOTIFICATION WEBHOOK (OTOMATIS BUAT KEY & KIRIM KE DM + CHANNEL) ---
+app.post('/api/notification', async (req, res) => {
+    try {
+        const notificationResponse = await coreApi.transaction.notification(req.body);
+        const orderId = notificationResponse.order_id;
+        const transactionStatus = notificationResponse.transaction_status;
+        const fraudStatus = notificationResponse.fraud_status;
+
+        console.log(`🔔 Notifikasi Midtrans diterima untuk Order ID: ${orderId}, Status:${transactionStatus}`);
+
+        if (transactionStatus == 'settlement' || (transactionStatus == 'capture' && fraudStatus == 'accept')) {
+            const parts = orderId.split('-');
+            if (parts.length >= 3) {
+                const durationDays = parseInt(parts[1].replace('D', '')) || 1;
+                const discordId = parts[2];
+
+                const randomString = Math.random().toString(36).substring(2, 8).toUpperCase();
+                const keyName = `BOBOHUB-${durationDays}D-${randomString}-2026`;
+
+                await KeyModel.create({
+                    keyString: keyName,
+                    durationDays: durationDays,
+                    discordId: discordId
+                });
+
+                // 1. Kirim Key via DM ke User
+                try {
+                    const user = await client.users.fetch(discordId);
+                    if (user) {
+                        await user.send(`🎉 **Pembayaran Berhasil!** Terima kasih telah membeli akses BOBOHUB.\n\n🔑 **Key Anda:** \`${keyName}\`\n⏳ **Durasi:** ${durationDays} Hari\n\nSilakan gunakan tombol **Redeem Key** di server Discord untuk mengaktifkannya!`);
+                        console.log(`✅ Key ${keyName} berhasil dikirim via DM ke user${discordId}`);
+                    }
+                } catch (dmErr) {
+                    console.error(`⚠️ Gagal mengirim DM ke user ${discordId}, tapi key sudah dibuat:${keyName}`);
+                }
+
+                // 2. Kirim Notifikasi Publik ke Channel Discord Utama
+                try {
+                    const targetChannelId = process.env.CHANNEL_ID;
+                    if (targetChannelId) {
+                        const channel = await client.channels.fetch(targetChannelId);
+                        if (channel) {
+                            const successEmbed = new EmbedBuilder()
+                                .setTitle('🎉 Pembayaran Berhasil & Dana Masuk!')
+                                .setDescription(`Pengguna <@${discordId}> telah berhasil membeli akses **BOBOHUB** durasi **${durationDays} Hari** via QRIS!\n\n🔑 *Key telah dikirimkan secara otomatis ke DM pembeli.*`)
+                                .setColor(0x00FF00)
+                                .setTimestamp();
+
+                            await channel.send({ embeds: [successEmbed] });
+                        }
+                    }
+                } catch (channelErr) {
+                    console.error('⚠️ Gagal mengirim pengumuman ke channel publik:', channelErr);
+                }
+            }
+        }
+
+        return res.status(200).json({ status: 'OK' });
+    } catch (error) {
+        console.error('❌ Midtrans Webhook Error:', error);
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server berjalan di port ${PORT}`));
 
-// --- 3. DISCORD BOT SETUP ---
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers
-    ]
-});
-
+// --- 4. DISCORD BOT EVENT READY ---
 client.once('ready', async () => {
     console.log(`🤖 Discord Bot aktif sebagai ${client.user.tag}`);
 
@@ -155,7 +225,7 @@ client.once('ready', async () => {
     }
 });
 
-// --- 4. COMMAND ADMIN (!genkey & !clear) ---
+// --- 5. COMMAND ADMIN (!genkey & !clear) ---
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
@@ -224,26 +294,24 @@ client.on('messageCreate', async message => {
     }
 });
 
-// --- 5. HANDLE INTERAKSI TOMBOL, MENU, & MODAL ---
+// --- 6. HANDLE INTERAKSI TOMBOL, MENU, & MODAL ---
 client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
-        const adminRoleId = process.env.ADMIN_ROLE_ID;
-
         if (interaction.customId === 'btn_access') {
             const selectMenu = new StringSelectMenuBuilder()
                 .setCustomId('select_duration')
-                .setPlaceholder('Pilih durasi akses...')
+                .setPlaceholder('Pilih durasi akses untuk pembayaran QRIS...')
                 .addOptions([
-                    { label: '1 Day - Rp7,400', value: '1_day' },
-                    { label: '7 Days - Rp31,600', value: '7_days' },
-                    { label: '30 Days - Rp68,500', value: '30_days' }
+                    { label: '1 Day - Rp7,400', value: '1_7400' },
+                    { label: '7 Days - Rp31,600', value: '7_31600' },
+                    { label: '30 Days - Rp68,500', value: '30_68500' }
                 ]);
 
             const row = new ActionRowBuilder().addComponents(selectMenu);
 
             const embed = new EmbedBuilder()
-                .setTitle('💎 BOBOHUB Instant Access')
-                .setDescription('Silakan pilih durasi akses yang Anda inginkan di menu bawah ini.\n\n**Pricing:**\n• 1 Day = Rp7,400\n• 7 Days = Rp31,600\n• 30 Days = Rp68,500\n\n*Pesan ini bersifat privat dan hanya Anda yang dapat melihatnya.*')
+                .setTitle('💎 BOBOHUB Instant Access (QRIS Sandbox)')
+                .setDescription('Silakan pilih durasi akses di bawah ini untuk memunculkan QRIS pembayaran otomatis.\n\n**Pricing:**\n• 1 Day = Rp7,400\n• 7 Days = Rp31,600\n• 30 Days = Rp68,500')
                 .setColor(0x00FF00);
 
             await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
@@ -285,31 +353,54 @@ client.on('interactionCreate', async interaction => {
 
         if (interaction.customId === 'btn_script') {
             await interaction.reply({ 
-                content: '📜 **BOBOHUB Script Loadstring:**\n`loadstring(game:HttpGet("LINK_SCRIPT_ANDA_DISINI"))()`', 
+                content: '📜 **BOBOHUB Script Loadstring:**\n`https://raw.githubusercontent.com/bokaganteng12-wq/idv/refs/heads/main/idv`', 
                 ephemeral: true 
             });
         }
 
         if (interaction.customId === 'btn_mykeys') {
+            await interaction.deferReply({ ephemeral: true });
             const userKeys = await KeyModel.find({ discordId: interaction.user.id });
             if (userKeys.length === 0) {
-                return interaction.reply({ content: '❌ Anda belum memiliki atau me-redeem key BOBOHUB apapun.', ephemeral: true });
+                return interaction.editReply({ content: '❌ Anda belum memiliki atau me-redeem key BOBOHUB apapun.' });
             }
 
             let desc = userKeys.map(k => `• **Key:** \`${k.keyString}\`\n  **HWID Terkunci:** \`${k.hwid || 'Belum di-bind'}\`\n  **Sisa Reset:** ${2 - k.resetCount} kali\n  **Expired:** ${k.expiresAt ? k.expiresAt.toLocaleString() : 'Belum aktif'}`).join('\n\n');
             
-            await interaction.reply({ content: `📊 **Daftar Key BOBOHUB Anda:**\n\n${desc}`, ephemeral: true });
+            await interaction.editReply({ content: `📊 **Daftar Key BOBOHUB Anda:**\n\n${desc}` });
         }
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === 'select_duration') {
-        const chosen = interaction.values[0];
-        const adminRoleId = process.env.ADMIN_ROLE_ID;
+        await interaction.deferReply({ ephemeral: true });
+        const [durationDays, amount] = interaction.values[0].split('_');
 
-        await interaction.reply({ 
-            content: `✅ Anda memilih durasi **${chosen.replace('_', ' ')}**.\nSilakan hubungi Admin (<@&${adminRoleId}>) via DM untuk melakukan pembayaran dan mendapatkan kode key Anda!`, 
-            ephemeral: true 
-        });
+        try {
+            const orderId = `BOBO-${durationDays}D-${interaction.user.id}-${Date.now()}`;
+            const parameter = {
+                "payment_type": "qris",
+                "transaction_details": {
+                    "order_id": orderId,
+                    "gross_amount": parseInt(amount)
+                },
+                "qris": { "acquirer": "gopay" }
+            };
+
+            const chargeResponse = await coreApi.charge(parameter);
+            const qrImageUrl = chargeResponse.actions && chargeResponse.actions[0] ? chargeResponse.actions[0].url : null;
+
+            const embed = new EmbedBuilder()
+                .setTitle('📱 Scan QRIS untuk Pembayaran')
+                .setDescription(`Durasi: **${durationDays} Hari**\nTotal: **Rp${parseInt(amount).toLocaleString()}**\n\nSilakan scan QR Code di bawah menggunakan e-wallet (GoPay, DANA, OVO, m-Banking) berlogo QRIS (Sandbox).\n\n*(Key akan **otomatis dikirim via DM** & pengumuman sukses akan muncul di channel setelah pembayaran berhasil!)*`)
+                .setImage(qrImageUrl)
+                .setColor(0xFFA500);
+
+            await interaction.editReply({ embeds: [embed] });
+
+        } catch (error) {
+            console.error(error);
+            await interaction.editReply({ content: '❌ Gagal membuat tagihan QRIS Midtrans. Pastikan Server Key Sandbox Anda valid di dalam file .env.' });
+        }
     }
 
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'modal_redeem') {
